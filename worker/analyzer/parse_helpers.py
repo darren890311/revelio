@@ -168,7 +168,8 @@ def extract_prices_from_variants(variants: list[dict[str, Any]]) -> list[dict[st
     The promo requires a transient sitewide code, so it is NOT the deal price: we
     keep it aside and never compare on it. The true strike-through anchor is often
     absent from JSON-LD (only the promo SalePrice is given), so `original_price`
-    may come back None here - merge_dom_anchor() fills it from the rendered DOM.
+    may come back None here. This is only a FALLBACK for the rare path with no
+    rendered DOM; extract_prices_from_dom() is the primary, reliable source.
     """
     out = []
     for v in variants:
@@ -204,13 +205,6 @@ def extract_prices_from_variants(variants: list[dict[str, Any]]) -> list[dict[st
     return out
 
 
-_PCT_BADGE_RE = re.compile(r"^-?\d{1,3}\s*%$")
-
-
-def _has_line_through(span) -> bool:
-    return "line-through" in " ".join(span.get("class") or [])
-
-
 def extract_prices_from_dom(soup: BeautifulSoup) -> list[dict[str, float]]:
     """Authoritative per-tier pricing straight off the rendered DOM.
 
@@ -218,66 +212,47 @@ def extract_prices_from_dom(soup: BeautifulSoup) -> list[dict[str, float]]:
     the JSON-LD `offers.price`/`priceSpecification` carry the (lower) Groupon and
     promo-code prices in inconsistent roles, and the TRUE strike-through anchor
     ($258 on a "$258 / $85.14 -67% / $63.86 with code" tier) never appears there
-    at all - it renders only as a `line-through` span. So we read what the shopper
-    sees, anchored on the `-XX%` discount badge:
+    at all - it renders only in the DOM. Groupon tags each price with a stable
+    `data-testid`, so we read exactly what the shopper sees:
 
-        From  <s>$258</s>  $85.14  [-67%]   $63.86 with code RELAX
-              └ original ┘  └ deal ┘ └badge┘ └────── promo ───────┘
+        <span data-testid="strike-through-price">$258</span>   ← original
+        <span data-testid="green-price">$85.14</span>          ← deal price
+        <span data-testid="discount">-67%</span>               ← (badge, unused)
+        ... "$63.86 with code RELAX" lives elsewhere            ← promo, ignored
 
-    For each badge (skipping competitor `a[data-bhd]` cards), the deal price is
-    the nearest non-struck price BEFORE it, and the original is the largest
-    line-through price in the same contiguous cluster (stopping at the previous
-    tier's price/badge, so a neighbouring option can't leak its anchor in). The
-    "with code" promo sits AFTER the badge and is deliberately not returned - we
-    never compare on it. Deduped by (original, deal) so a tier rendered twice
-    (selected card + list row) collapses to one.
+    The deal price is the `green-price`; the original is the `strike-through-price`
+    in the same price block. We skip anything inside an `a[data-bhd]` competitor
+    tile, and dedupe by (original, deal) so a tier rendered twice (selected card +
+    list row) collapses to one. The "with code" promo is deliberately not read -
+    we never compare on it.
     """
     out: list[dict[str, float]] = []
     seen: set[tuple[float, float]] = set()
-    for badge in soup.find_all("span"):
-        if not _PCT_BADGE_RE.match((badge.get_text() or "").strip()):
-            continue
-        if badge.find_parent("a", attrs={"data-bhd": True}) is not None:
+    for green in soup.select('[data-testid="green-price"]'):
+        if green.find_parent("a", attrs={"data-bhd": True}) is not None:
             continue  # a "Similar deals" competitor tile, not this deal
-
-        # Climb to the smallest ancestor that also holds a strike-through price.
-        container = badge
-        for _ in range(5):
-            container = container.parent
-            if container is None:
-                break
-            if container.select_one('span[class*="line-through"]'):
-                break
-        if container is None:
-            continue
-        spans = container.find_all("span")
-        try:
-            bi = spans.index(badge)
-        except ValueError:
+        deal = money(green.get_text())
+        if deal is None or deal <= 0:
             continue
 
-        # Walk backward from the badge: the first non-struck price is this tier's
-        # deal price; the struck prices before it are its anchor candidates. Stop
-        # at the previous tier (its badge, or a second non-struck price).
-        deal = None
-        originals: list[float] = []
-        for sib in reversed(spans[:bi]):
-            txt = (sib.get_text() or "").strip()
-            if _PCT_BADGE_RE.match(txt):
-                break  # reached the previous tier's badge
-            val = money(txt)
-            if val is None or val <= 0:
-                continue
-            if _has_line_through(sib):
-                originals.append(val)
-            elif deal is None:
-                deal = val
-            else:
-                break  # a second plain price = previous tier; stop
-        if deal is None or not originals:
+        # The strike-through anchor sits in the same price block; climb to the
+        # smallest ancestor that contains one so a neighbouring tier can't leak in.
+        strikes = []
+        block = green
+        for _ in range(4):
+            block = block.parent
+            if block is None:
+                break
+            strikes = block.select('[data-testid="strike-through-price"]')
+            if strikes:
+                break
+        # A tier may render an intermediate struck price too (e.g. $450 then
+        # $292.50); the true regular-price anchor is the highest of them.
+        vals = [v for v in (money(s.get_text()) for s in strikes) if v is not None and v > 0]
+        if not vals:
             continue
-        original = max(originals)
-        if deal >= original:
+        original = max(vals)
+        if original <= deal:
             continue
 
         key = (round(original, 2), round(deal, 2))
