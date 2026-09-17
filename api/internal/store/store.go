@@ -58,6 +58,20 @@ func (r *Redis) Put(ctx context.Context, url string, result json.RawMessage, ttl
 	return r.client.Set(ctx, keyPrefix+url, []byte(result), ttl).Err()
 }
 
+// Incr atomically increments a counter and (re)sets its TTL, returning the new
+// value. Callers key it by a time bucket (per-minute / per-day), so the counter
+// naturally rolls over; the window just needs to outlast the bucket. Used for
+// per-IP rate limiting and the global daily budget cap.
+func (r *Redis) Incr(ctx context.Context, key string, window time.Duration) (int64, error) {
+	pipe := r.client.TxPipeline()
+	incr := pipe.Incr(ctx, keyPrefix+key)
+	pipe.Expire(ctx, keyPrefix+key, window)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return 0, err
+	}
+	return incr.Val(), nil
+}
+
 func (r *Redis) Ping(ctx context.Context) error { return r.client.Ping(ctx).Err() }
 
 func (r *Redis) Close() error { return r.client.Close() }

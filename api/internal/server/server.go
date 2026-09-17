@@ -20,14 +20,25 @@ import (
 const workerTimeout = 90 * time.Second
 
 type Server struct {
-	cache  store.Cache
-	worker *worker.Client
-	ttl    time.Duration
-	log    *slog.Logger
+	cache   store.Cache
+	worker  *worker.Client
+	ttl     time.Duration
+	log     *slog.Logger
+	limiter Limiter
+	limits  Limits
 }
 
 func New(cache store.Cache, w *worker.Client, ttl time.Duration, log *slog.Logger) *Server {
 	return &Server{cache: cache, worker: w, ttl: ttl, log: log}
+}
+
+// WithLimits enables the per-IP rate limits and the global daily budget cap,
+// backed by the given Limiter (the Redis store). Optional: without it the
+// endpoint runs unguarded (used by unit tests).
+func (s *Server) WithLimits(l Limiter, limits Limits) *Server {
+	s.limiter = l
+	s.limits = limits
+	return s
 }
 
 type analyzeRequest struct {
@@ -62,6 +73,12 @@ func (s *Server) analyze(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
+
+	// Per-IP rate limit first, before any work (a 429 here is the cheapest reply).
+	if !s.allowRequest(c, ctx) {
+		return
+	}
+
 	key := normalizeURL(req.URL)
 
 	// Cache hit → serve the stored JSON straight through.
@@ -73,7 +90,14 @@ func (s *Server) analyze(c *gin.Context) {
 		return
 	}
 
-	// Miss → ask the worker, bounded by a timeout.
+	// Miss → this is the only path that spends money. Check the global daily
+	// budget cap before spending it, so a flood of unique URLs can't run up the
+	// Claude bill even if it comes from many IPs.
+	if !s.withinBudget(c, ctx) {
+		return
+	}
+
+	// Ask the worker, bounded by a timeout.
 	workerCtx, cancel := context.WithTimeout(ctx, workerTimeout)
 	defer cancel()
 	raw, status, err := s.worker.Analyze(workerCtx, req.URL, req.HTML)

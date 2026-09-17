@@ -39,7 +39,13 @@ func main() {
 	}
 	defer cache.Close()
 
-	srv := server.New(cache, worker.New(cfg.WorkerURL), cfg.CacheTTL, log)
+	srv := server.New(cache, worker.New(cfg.WorkerURL), cfg.CacheTTL, log).
+		WithLimits(cache, server.Limits{
+			PerMinute:   cfg.RatePerMin,
+			PerDay:      cfg.RatePerDay,
+			DailyBudget: cfg.DailyBudget,
+		})
+	log.Info("abuse guards", "per_min", cfg.RatePerMin, "per_day", cfg.RatePerDay, "daily_budget", cfg.DailyBudget)
 	httpServer := &http.Server{
 		Addr:    ":" + cfg.Port,
 		Handler: srv.Router(cfg.AllowedOrigin),
