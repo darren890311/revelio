@@ -70,3 +70,8 @@ app anymore — the site is a marketing landing page only.
   signal**, not a fourth axis.
 - No affiliate / no buy button, by design — an honest advisor shouldn't be paid by the platform
   it critiques.
+- **Gateway abuse guards (cost protection).** The public `/analyze` is rate-limited per IP
+  (`RATE_PER_MIN`/`RATE_PER_DAY` → 429) and capped by a global daily worker-call budget
+  (`DAILY_BUDGET` → 503, counted only on cache misses) — see `api/internal/server/ratelimit.go`.
+  All three are env vars (tune in Cloud Run, no redeploy); limiter errors fail open. A private
+  worker closes the bypass path but does NOT limit the gateway itself, which is why these live here.

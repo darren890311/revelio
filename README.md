@@ -101,6 +101,14 @@ A few decisions worth calling out:
   are computed in code; the LLM only extracts and narrates.
 - **The worker is private.** `allUsers` invoke access is removed; the gateway
   authenticates with an OIDC identity token (`google.golang.org/api/idtoken`).
+- **The gateway is the abuse chokepoint.** A private worker only closes the *bypass*
+  path - the public `/analyze` endpoint is still where cost is spent, so the gateway
+  guards it with two Redis-backed limits: a per-IP rate limit (`RATE_PER_MIN` /
+  `RATE_PER_DAY` → `429`) stops one caller hammering it, and a **global daily
+  budget cap** on worker calls (`DAILY_BUDGET` → `503`) is a spend fuse that holds
+  even against many IPs. Only cache *misses* count against the budget, since hits
+  cost nothing; limiter errors fail open so a Redis blip can't take the service down.
+  All three limits are env-tunable without a redeploy.
 - **Failures aren't cached.** A datacenter IP occasionally gets a bot-challenge page; the
   worker retries once and, if still empty, returns an error instead of caching "no data".
 - **No-city chains are anchored with `regionCode=US`** so a location-less query (e.g.
