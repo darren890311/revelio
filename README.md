@@ -44,7 +44,7 @@ One analyzer (the extension) plus a marketing landing page, one backend:
                 │  identity-token auth
                 ▼
             Python worker (FastAPI, private, Cloud Run)
-              parse (BeautifulSoup + Groupon's embedded __NEXT_DATA__ / __APOLLO_STATE__)
+              parse (BeautifulSoup: JSON-LD ProductGroup + the rendered price DOM via data-testid)
               → discount math → competitors (Claude) → reputation (Google Places)
               → direct booking (Tavily + Claude) → verdict (Claude)
               ↑ headless-Chromium scrape (Playwright) ONLY when the extension can't supply page HTML
@@ -82,14 +82,18 @@ A few decisions worth calling out:
 - **One backend, two clients - and the extension makes scraping client-side.** The
   extension reads the deal page in the user's own browser (real IP, page already
   rendered) and posts the HTML, so the worker doesn't run headless Chromium for it.
-- **Stale `__NEXT_DATA__` on SPA navigation is detected.** Groupon is a single-page app:
-  navigating deal→deal updates the DOM but leaves the server-rendered `__NEXT_DATA__` on
-  the first deal. The extension only sends the page when its embedded `getDeal` slug
-  matches the URL; otherwise it sends URL-only and the worker fetches the deal fresh.
-- **Pricing is read from Groupon's embedded data (`__NEXT_DATA__`), not JSON-LD.** On
-  promo-code deals the JSON-LD reports the deal price as the anchor and the promo price
-  as the "sale," yielding a wrong discount; the embedded `DealOption` data carries the
-  true strike-through.
+- **Stale page on SPA navigation is detected.** Groupon is a single-page app: navigating
+  deal→deal updates the DOM but the server-rendered markup can lag the first deal. The
+  extension only sends the page when the JSON-LD `ProductGroup` slug matches the URL;
+  otherwise it sends URL-only and the worker fetches the deal fresh. (Groupon migrated off
+  Next.js to an Apollo/GraphQL SPA and dropped the old `__NEXT_DATA__` blob, so the slug
+  check now reads the JSON-LD block that is still server-rendered for SEO.)
+- **Pricing is read from the rendered DOM, not JSON-LD.** Since the SPA migration, JSON-LD
+  is unreliable for price: on a promo deal `offers.price`/`priceSpecification` carry the
+  Groupon and with-code prices in inconsistent roles, and the true strike-through anchor
+  (e.g. `$258` before a `$85.14` deal) is absent entirely. The worker instead reads the
+  prices the shopper sees via Groupon's stable `data-testid`s (`strike-through-price`,
+  `green-price`), and joins the JSON-LD option labels back by matching the deal price.
 - **Judgments refuse cross-scope comparisons.** Comparability and direct-booking treat a
   different quantity/coverage (3 vs 5 attractions, a smaller package) as at most
   *similar*, never *same*, even under a matching brand. A full-star, well-sampled

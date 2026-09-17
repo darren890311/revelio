@@ -53,6 +53,16 @@ app anymore — the site is a marketing landing page only.
 
 ## Current state (things that changed)
 
+- **Groupon migrated off Next.js to an Apollo/GraphQL SPA and dropped `__NEXT_DATA__`.** The
+  deal data no longer ships as an embedded blob. What's still server-rendered is the JSON-LD
+  (`ProductGroup` for labels/Groupon price/rating, kept for SEO) plus the price DOM. Two
+  consequences the parsers rely on: (1) the extension's freshness gate reads the JSON-LD
+  `ProductGroup` slug, not `__NEXT_DATA__` (`extension/utils/page.ts`); (2) **prices come from
+  the rendered DOM, not JSON-LD** — JSON-LD carries the Groupon/with-code prices in
+  inconsistent roles and omits the true strike-through anchor, so `parse_helpers.extract_prices_from_dom`
+  reads Groupon's stable `data-testid`s (`strike-through-price` = anchor, `green-price` = deal
+  price), skips `a[data-bhd]` competitor tiles, and JSON-LD only supplies the option labels.
+  The with-code promo price is deliberately ignored (we never compare on a transient code).
 - Reputation is **Google Places only** — Yelp was removed (its API went paid). The gap logic
   already degrades to Groupon-vs-Google.
 - Verdict = three signals (discount / price / reputation): all ok → buy, all bad → skip, else
