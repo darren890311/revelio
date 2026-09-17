@@ -18,12 +18,13 @@ from .parse_helpers import (
     extract_faqs,
     extract_fine_print,
     extract_highlights,
+    extract_prices_from_dom,
     extract_prices_from_next_data,
     extract_prices_from_variants,
     find_business,
+    variant_price_labels,
     find_jsonld,
     list_schema_types,
-    money,
     text,
 )
 
@@ -60,29 +61,33 @@ def parse_audit(html: str, url: str) -> dict[str, Any]:
         (soup.find("meta", attrs={"name": "description"}) or {}).get("content")
     )
 
-    # Prefer the Next.js DealOption pricing (true strike-through anchor); fall
-    # back to JSON-LD only if it's absent, since JSON-LD mis-reports promo deals.
-    prices = extract_prices_from_next_data(soup)
-    if not prices:
-        variants = product.get("hasVariant") or []
-        prices = extract_prices_from_variants(variants if isinstance(variants, list) else [])
-    if not prices and isinstance(product.get("offers"), (dict, list)):
+    # Pricing sources, in order of fidelity:
+    #  1. The rendered DOM (PRIMARY). Groupon's SPA gives JSON-LD prices in
+    #     inconsistent roles and omits the true strike-through anchor entirely, so
+    #     the only reliable prices are the ones the shopper actually sees. We take
+    #     original + deal + discount from there and borrow the option LABEL from
+    #     JSON-LD (whose labels are reliable) by matching the DOM deal price.
+    #  2. JSON-LD ProductGroup variants (FALLBACK) when the DOM has no rendered
+    #     price tiers - e.g. the rare SPA-navigation path that fetches server HTML
+    #     before client hydration. Anchors are unreliable here, but a verdict
+    #     still returns.
+    #  3. Legacy Next.js DealOption state, for any older cached pages.
+    variants = product.get("hasVariant")
+    if not variants and isinstance(product.get("offers"), (dict, list)):
+        # A single-offer Product (no ProductGroup): shape it like one variant.
         offer = product["offers"]
-        if isinstance(offer, list):
-            offer = offer[0] if offer else {}
-        if isinstance(offer, dict):
-            list_price = money(offer.get("price"))
-            spec = offer.get("priceSpecification") or {}
-            deal_price = money(spec.get("price")) if isinstance(spec, dict) else None
-            discount_pct = None
-            if list_price and deal_price and list_price > 0 and deal_price < list_price:
-                discount_pct = round((1 - deal_price / list_price) * 100, 1)
-            prices = [{
-                "label": offer.get("name") or "Default",
-                "original_price": list_price,
-                "deal_price": deal_price or list_price,
-                "discount_pct": discount_pct,
-            }]
+        offer = (offer[0] if offer else {}) if isinstance(offer, list) else offer
+        variants = [{"name": product.get("name"), "offers": offer}] if isinstance(offer, dict) else []
+    variants = variants if isinstance(variants, list) else []
+
+    dom_tiers = extract_prices_from_dom(soup)
+    if dom_tiers:
+        labels = variant_price_labels(variants)
+        for t in dom_tiers:
+            t["label"] = labels.get(round(t["deal_price"], 2), "Default")
+        prices = dom_tiers
+    else:
+        prices = extract_prices_from_next_data(soup) or extract_prices_from_variants(variants)
 
     aggregate = product.get("aggregateRating") or {}
     if not aggregate and business:

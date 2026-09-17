@@ -151,7 +151,9 @@ def parse_similar_cards(html: str) -> list[dict[str, Any]]:
             "original_price": listp / 100 if isinstance(listp, (int, float)) else None,
             "discount_pct": prices.get("discount"),
             "rating": rating.get("numeric_value"),
-            "rating_count": rating.get("number_of_ratings"),
+            # Groupon's SPA renamed the count field to "count"; keep the old name
+            # as a fallback for older cached cards.
+            "rating_count": rating.get("count") or rating.get("number_of_ratings"),
         })
     return out
 

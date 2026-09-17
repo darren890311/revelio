@@ -160,6 +160,16 @@ def extract_faqs(blocks: list[dict[str, Any]]) -> list[dict[str, str]]:
 # --- pricing ---------------------------------------------------------------
 
 def extract_prices_from_variants(variants: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per-tier pricing from JSON-LD ProductGroup variants.
+
+    `offers.price` is the standard Groupon price - the deal price we compare on.
+    `priceSpecification` is EITHER a ListPrice (higher → the strike-through anchor)
+    or a SalePrice (lower → a promo-code price, e.g. "$14.79 with code FALL").
+    The promo requires a transient sitewide code, so it is NOT the deal price: we
+    keep it aside and never compare on it. The true strike-through anchor is often
+    absent from JSON-LD (only the promo SalePrice is given), so `original_price`
+    may come back None here - merge_dom_anchor() fills it from the rendered DOM.
+    """
     out = []
     for v in variants:
         if not isinstance(v, dict):
@@ -169,24 +179,144 @@ def extract_prices_from_variants(variants: list[dict[str, Any]]) -> list[dict[st
             offer = offer[0] if offer else {}
         if not isinstance(offer, dict):
             continue
-        list_price = money(offer.get("price"))
-        deal_price = list_price
+        groupon_price = money(offer.get("price"))
+        original_price = None
+        promo_price = None
         spec = offer.get("priceSpecification")
         if isinstance(spec, dict):
-            sale = money(spec.get("price"))
-            if sale is not None:
+            sp = money(spec.get("price"))
+            if sp is not None and groupon_price is not None:
                 price_type = (spec.get("priceType") or "").lower()
-                if "saleprice" in price_type or sale < (list_price or 0):
-                    deal_price = sale
+                if "listprice" in price_type or sp > groupon_price:
+                    original_price = sp  # a real strike-through anchor
+                elif "saleprice" in price_type or sp < groupon_price:
+                    promo_price = sp  # promo-code price; kept aside, not compared on
         discount_pct = None
-        if list_price and deal_price and list_price > 0 and deal_price < list_price:
-            discount_pct = round((1 - deal_price / list_price) * 100, 1)
+        if original_price and groupon_price and original_price > 0 and groupon_price < original_price:
+            discount_pct = round((1 - groupon_price / original_price) * 100, 1)
         out.append({
             "label": v.get("name") or "Default",
-            "original_price": list_price,
-            "deal_price": deal_price,
+            "original_price": original_price,
+            "deal_price": groupon_price,
             "discount_pct": discount_pct,
+            "promo_price": promo_price,
         })
+    return out
+
+
+_PCT_BADGE_RE = re.compile(r"^-?\d{1,3}\s*%$")
+
+
+def _has_line_through(span) -> bool:
+    return "line-through" in " ".join(span.get("class") or [])
+
+
+def extract_prices_from_dom(soup: BeautifulSoup) -> list[dict[str, float]]:
+    """Authoritative per-tier pricing straight off the rendered DOM.
+
+    Groupon's SPA no longer embeds trustworthy prices in JSON-LD: on a promo deal
+    the JSON-LD `offers.price`/`priceSpecification` carry the (lower) Groupon and
+    promo-code prices in inconsistent roles, and the TRUE strike-through anchor
+    ($258 on a "$258 / $85.14 -67% / $63.86 with code" tier) never appears there
+    at all - it renders only as a `line-through` span. So we read what the shopper
+    sees, anchored on the `-XX%` discount badge:
+
+        From  <s>$258</s>  $85.14  [-67%]   $63.86 with code RELAX
+              └ original ┘  └ deal ┘ └badge┘ └────── promo ───────┘
+
+    For each badge (skipping competitor `a[data-bhd]` cards), the deal price is
+    the nearest non-struck price BEFORE it, and the original is the largest
+    line-through price in the same contiguous cluster (stopping at the previous
+    tier's price/badge, so a neighbouring option can't leak its anchor in). The
+    "with code" promo sits AFTER the badge and is deliberately not returned - we
+    never compare on it. Deduped by (original, deal) so a tier rendered twice
+    (selected card + list row) collapses to one.
+    """
+    out: list[dict[str, float]] = []
+    seen: set[tuple[float, float]] = set()
+    for badge in soup.find_all("span"):
+        if not _PCT_BADGE_RE.match((badge.get_text() or "").strip()):
+            continue
+        if badge.find_parent("a", attrs={"data-bhd": True}) is not None:
+            continue  # a "Similar deals" competitor tile, not this deal
+
+        # Climb to the smallest ancestor that also holds a strike-through price.
+        container = badge
+        for _ in range(5):
+            container = container.parent
+            if container is None:
+                break
+            if container.select_one('span[class*="line-through"]'):
+                break
+        if container is None:
+            continue
+        spans = container.find_all("span")
+        try:
+            bi = spans.index(badge)
+        except ValueError:
+            continue
+
+        # Walk backward from the badge: the first non-struck price is this tier's
+        # deal price; the struck prices before it are its anchor candidates. Stop
+        # at the previous tier (its badge, or a second non-struck price).
+        deal = None
+        originals: list[float] = []
+        for sib in reversed(spans[:bi]):
+            txt = (sib.get_text() or "").strip()
+            if _PCT_BADGE_RE.match(txt):
+                break  # reached the previous tier's badge
+            val = money(txt)
+            if val is None or val <= 0:
+                continue
+            if _has_line_through(sib):
+                originals.append(val)
+            elif deal is None:
+                deal = val
+            else:
+                break  # a second plain price = previous tier; stop
+        if deal is None or not originals:
+            continue
+        original = max(originals)
+        if deal >= original:
+            continue
+
+        key = (round(original, 2), round(deal, 2))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "original_price": original,
+            "deal_price": deal,
+            "discount_pct": round((1 - deal / original) * 100, 1),
+        })
+    return out
+
+
+def variant_price_labels(variants: list[dict[str, Any]]) -> dict[float, str]:
+    """Map every price a JSON-LD variant mentions (its `offers.price` and its
+    `priceSpecification.price`) to that variant's option label. A DOM tier's deal
+    price always equals one of these, so this joins the DOM's (reliable) prices
+    back to the (reliable) JSON-LD labels without trusting JSON-LD's price roles."""
+    out: dict[float, str] = {}
+    for v in variants:
+        if not isinstance(v, dict):
+            continue
+        label = v.get("name")
+        if not label:
+            continue
+        offer = v.get("offers")
+        if isinstance(offer, list):
+            offer = offer[0] if offer else {}
+        if not isinstance(offer, dict):
+            continue
+        candidates = [offer.get("price")]
+        spec = offer.get("priceSpecification")
+        if isinstance(spec, dict):
+            candidates.append(spec.get("price"))
+        for c in candidates:
+            val = money(c)
+            if val is not None:
+                out[round(val, 2)] = label
     return out
 
 
